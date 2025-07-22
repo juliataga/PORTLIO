@@ -3,8 +3,8 @@
 
 import { useRouter } from 'next/navigation'
 import { useState } from 'react'
-import { useAuth } from '@/hooks/useAuth'
-import { useSubscription } from '@/hooks/useSubscription'
+import { useAuth } from '../hooks/useAuth'
+import { useSubscription } from '../hooks/useSubscription'
 import toast from 'react-hot-toast'
 
 export default function PricingPage() {
