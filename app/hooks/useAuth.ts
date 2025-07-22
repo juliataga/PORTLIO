@@ -1,210 +1,258 @@
-import { useEffect, useState } from 'react'
-import { User } from '@supabase/supabase-js'
-import { supabase } from '@/lib/supabase'
-import { useRouter } from 'next/navigation'
+'use client'
 
-export type UserType = 'freelancer' | 'client'
+import { useEffect, useState, useCallback } from 'react'
+import { User, Session } from '@supabase/supabase-js'
+import { supabase } from '@/lib/supabase'
+
+interface UserProfile {
+  id: number
+  user_id: string
+  full_name: string | null
+  email: string
+  plan_id: string
+  trial_ends_at: string | null
+  created_at: string
+  updated_at: string
+}
+
+interface AuthState {
+  user: User | null
+  profile: UserProfile | null
+  loading: boolean
+  error: string | null
+}
 
 export function useAuth() {
-  const [user, setUser] = useState<User | null>(null)
-  const [userType, setUserType] = useState<UserType | null>(null)
-  const [profile, setProfile] = useState<any>(null)
-  const [loading, setLoading] = useState(true)
-  const router = useRouter()
+  const [state, setState] = useState<AuthState>({
+    user: null,
+    profile: null,
+    loading: true,
+    error: null
+  })
 
-  useEffect(() => {
-    // Get initial session
-    const getInitialSession = async () => {
-      const { data: { session } } = await supabase.auth.getSession()
-      if (session?.user) {
-        setUser(session.user)
-        await loadUserProfile(session.user.id)
+  const setUser = useCallback((user: User | null) => {
+    setState(prev => ({ ...prev, user }))
+  }, [])
+
+  const setProfile = useCallback((profile: UserProfile | null) => {
+    setState(prev => ({ ...prev, profile }))
+  }, [])
+
+  const setLoading = useCallback((loading: boolean) => {
+    setState(prev => ({ ...prev, loading }))
+  }, [])
+
+  const setError = useCallback((error: string | null) => {
+    setState(prev => ({ ...prev, error }))
+  }, [])
+
+  const loadUserProfile = useCallback(async (userId: string) => {
+    try {
+      setError(null)
+      
+      const { data, error } = await supabase
+        .from('user_profiles')
+        .select('*')
+        .eq('user_id', userId)
+        .single()
+
+      if (error) {
+        // If profile doesn't exist, create it
+        if (error.code === 'PGRST116') {
+          const { data: userData } = await supabase.auth.getUser()
+          if (userData.user) {
+            const newProfile = {
+              user_id: userId,
+              email: userData.user.email || '',
+              full_name: userData.user.user_metadata?.full_name || null,
+              plan_id: 'free',
+              trial_ends_at: new Date(Date.now() + 14 * 24 * 60 * 60 * 1000).toISOString()
+            }
+
+            const { data: createdProfile, error: createError } = await supabase
+              .from('user_profiles')
+              .insert(newProfile)
+              .select()
+              .single()
+
+            if (createError) {
+              console.error('Error creating profile:', createError)
+              setError(createError.message)
+            } else {
+              setProfile(createdProfile)
+              
+              // Track signup event
+              await supabase.from('user_events').insert({
+                user_id: userId,
+                event_type: 'signup',
+                event_data: { 
+                  source: 'direct',
+                  trial_started: true 
+                }
+              })
+            }
+          }
+        } else {
+          console.error('Error loading profile:', error)
+          setError(error.message)
+        }
+      } else {
+        setProfile(data)
       }
+    } catch (err) {
+      console.error('Unexpected error:', err)
+      setError(err instanceof Error ? err.message : 'Unknown error')
+    }
+  }, [setProfile, setError])
+
+  const initializeAuth = useCallback(async () => {
+    try {
+      setLoading(true)
+      setError(null)
+
+      const { data: { user }, error } = await supabase.auth.getUser()
+      
+      if (error) {
+        setError(error.message)
+        setUser(null)
+        setProfile(null)
+        return
+      }
+      
+      setUser(user)
+      
+      if (user) {
+        await loadUserProfile(user.id)
+      }
+    } catch (err) {
+      console.error('Auth initialization error:', err)
+      setError(err instanceof Error ? err.message : 'Failed to initialize auth')
+    } finally {
       setLoading(false)
     }
+  }, [setUser, setProfile, setLoading, setError, loadUserProfile])
 
-    getInitialSession()
+  useEffect(() => {
+    initializeAuth()
 
     // Listen for auth changes
     const { data: { subscription } } = supabase.auth.onAuthStateChange(
-      async (event, session) => {
-        setUser(session?.user ?? null)
+      async (event, session: Session | null) => {
+        console.log('Auth state changed:', event)
         
-        if (session?.user) {
-          await loadUserProfile(session.user.id)
+        const user = session?.user ?? null
+        setUser(user)
+        
+        if (user) {
+          await loadUserProfile(user.id)
         } else {
-          setUserType(null)
           setProfile(null)
         }
+        
         setLoading(false)
       }
     )
 
     return () => subscription.unsubscribe()
-  }, [])
+  }, [initializeAuth, setUser, setProfile, setLoading, loadUserProfile])
 
-  const loadUserProfile = async (userId: string) => {
+  const signOut = useCallback(async () => {
     try {
-      console.log('Loading profile for user:', userId)
-
-      // Check if user is a client FIRST
-      const { data: clientProfile, error: clientError } = await supabase
-        .from('client_profiles')
-        .select('*')
-        .eq('user_id', userId)
-        .single()
-
-      console.log('Client profile check:', clientProfile, clientError)
-
-      if (clientProfile && !clientError) {
-        console.log('User is a CLIENT')
-        setUserType('client')
-        setProfile(clientProfile)
-        return 'client'
-      }
-
-      // If not a client, check freelancer profile
-      const { data: freelancerProfile, error: freelancerError } = await supabase
-        .from('user_subscriptions')
-        .select('*')
-        .eq('user_id', userId)
-        .single()
-
-      console.log('Freelancer profile check:', freelancerProfile, freelancerError)
-
-      if (freelancerProfile && !freelancerError) {
-        console.log('User is a FREELANCER')
-        setUserType('freelancer')
-        setProfile(freelancerProfile)
-        return 'freelancer'
-      }
-
-      // Default to freelancer for new users
-      console.log('Defaulting to FREELANCER')
-      setUserType('freelancer')
-      await ensureFreelancerProfile(userId)
-      return 'freelancer'
-
-    } catch (error) {
-      console.error('Error loading user profile:', error)
-      setUserType('freelancer')
-      await ensureFreelancerProfile(userId)
-      return 'freelancer'
-    }
-  }
-
-  const ensureFreelancerProfile = async (userId: string) => {
-    try {
-      await supabase
-        .from('user_subscriptions')
-        .upsert(
-          {
-            user_id: userId,
-            plan_id: 'free',
-            status: 'active'
-          },
-          {
-            onConflict: 'user_id',
-            ignoreDuplicates: true
-          }
-        )
-    } catch (error) {
-      console.error('Error creating freelancer subscription:', error)
-    }
-  }
-
-  const signOut = async () => {
-    await supabase.auth.signOut()
-    setUserType(null)
-    setProfile(null)
-    router.push('/')
-  }
-
-  const signInWithEmail = async (email: string, password: string) => {
-    const { data, error } = await supabase.auth.signInWithPassword({
-      email,
-      password,
-    })
-
-    // If login successful, determine user type and redirect
-    if (data.user && !error) {
-      const accountType = await loadUserProfile(data.user.id)
+      setError(null)
+      const { error } = await supabase.auth.signOut()
       
-      // Redirect based on account type
-      setTimeout(() => {
-        if (accountType === 'client') {
-          router.push('/client-dashboard')
-        } else {
-          router.push('/dashboard')
-        }
-      }, 500)
-    }
-
-    return { data, error }
-  }
-
-  const signUpWithEmail = async (email: string, password: string, accountType: UserType = 'freelancer') => {
-    const { data, error } = await supabase.auth.signUp({
-      email,
-      password,
-    })
-
-    if (data.user && !error) {
-      if (accountType === 'client') {
-        await createClientProfile(data.user.id)
-        setUserType('client')
-      } else {
-        await ensureFreelancerProfile(data.user.id)
-        setUserType('freelancer')
+      if (error) {
+        setError(error.message)
+        return false
       }
+      
+      // Clear state
+      setUser(null)
+      setProfile(null)
+      return true
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Sign out failed'
+      setError(message)
+      return false
+    }
+  }, [setUser, setProfile, setError])
+
+  const updateProfile = useCallback(async (updates: Partial<UserProfile>) => {
+    if (!state.user || !state.profile) {
+      const error = 'No user logged in'
+      setError(error)
+      return { error }
     }
 
-    return { data, error }
-  }
-
-  const createClientProfile = async (userId: string) => {
     try {
+      setError(null)
+      
       const { data, error } = await supabase
-        .from('client_profiles')
-        .insert({
-          user_id: userId,
-          contact_person: '',
-          company_name: '',
-          is_client: true
-        })
+        .from('user_profiles')
+        .update(updates)
+        .eq('user_id', state.user.id)
         .select()
         .single()
 
-      console.log('Created client profile:', data, error)
-      
-      if (!error) {
-        setProfile(data)
+      if (error) {
+        setError(error.message)
+        return { error: error.message }
       }
-    } catch (error) {
-      console.error('Error creating client profile:', error)
-    }
-  }
 
-  const redirectToDashboard = () => {
-    console.log('Redirecting based on user type:', userType)
-    if (userType === 'client') {
-      router.push('/client-dashboard')
-    } else {
-      router.push('/dashboard')
+      setProfile(data)
+      return { data }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Update failed'
+      setError(message)
+      return { error: message }
     }
-  }
+  }, [state.user, state.profile, setProfile, setError])
+
+  const isTrialActive = useCallback(() => {
+    if (!state.profile?.trial_ends_at) return false
+    return new Date(state.profile.trial_ends_at) > new Date()
+  }, [state.profile?.trial_ends_at])
+
+  const getTrialDaysLeft = useCallback(() => {
+    if (!state.profile?.trial_ends_at) return 0
+    const trialEnd = new Date(state.profile.trial_ends_at)
+    const now = new Date()
+    const diffTime = trialEnd.getTime() - now.getTime()
+    const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24))
+    return Math.max(0, diffDays)
+  }, [state.profile?.trial_ends_at])
+
+  const refresh = useCallback(() => {
+    initializeAuth()
+  }, [initializeAuth])
 
   return {
-    user,
-    userType,
-    profile,
-    loading,
+    // State
+    user: state.user,
+    profile: state.profile,
+    loading: state.loading,
+    error: state.error,
+    
+    // Actions
     signOut,
-    signInWithEmail,
-    signUpWithEmail,
-    isAuthenticated: !!user,
-    isClient: userType === 'client',
-    isFreelancer: userType === 'freelancer',
-    redirectToDashboard,
+    updateProfile,
+    refresh,
+    
+    // Helper functions
+    isTrialActive,
+    getTrialDaysLeft,
+    isAuthenticated: !!state.user,
+    isPro: state.profile?.plan_id === 'pro' || state.profile?.plan_id === 'agency',
+    isAgency: state.profile?.plan_id === 'agency',
+    isFree: state.profile?.plan_id === 'free' || !state.profile?.plan_id,
+    
+    // User info helpers
+    displayName: state.profile?.full_name || state.user?.email || 'User',
+    email: state.user?.email || '',
+    planName: state.profile?.plan_id || 'free',
+    
+    // Trial status
+    trialEnded: !isTrialActive() && state.profile?.trial_ends_at,
+    trialDaysLeft: getTrialDaysLeft(),
   }
 }

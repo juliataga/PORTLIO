@@ -24,6 +24,30 @@ export type Subscription = {
   stripe_customer_id: string | null
 }
 
+const DEFAULT_PLAN_LIMITS: Record<string, PlanLimits> = {
+  free: {
+    plan_id: 'free',
+    max_portals: 2,
+    max_monthly_views: 50,
+    has_custom_branding: false,
+    has_analytics: false
+  },
+  pro: {
+    plan_id: 'pro',
+    max_portals: 999999, // "unlimited"
+    max_monthly_views: 999999,
+    has_custom_branding: true,
+    has_analytics: true
+  },
+  agency: {
+    plan_id: 'agency',
+    max_portals: 999999,
+    max_monthly_views: 999999,
+    has_custom_branding: true,
+    has_analytics: true
+  }
+}
+
 export function useSubscription() {
   const [user, setUser] = useState<any>(null)
   const [subscription, setSubscription] = useState<Subscription | null>(null)
@@ -32,13 +56,14 @@ export function useSubscription() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
 
-  // Get user directly instead of using useAuth hook
   useEffect(() => {
     const getUser = async () => {
       const { data: { user } } = await supabase.auth.getUser()
       setUser(user)
       if (user) {
         loadSubscriptionData(user)
+      } else {
+        setLoading(false)
       }
     }
     getUser()
@@ -48,38 +73,27 @@ export function useSubscription() {
     if (!currentUser) return
 
     try {
-      // Load subscription
+      // Load user profile to get plan_id
+      const { data: profile, error: profileError } = await supabase
+        .from('user_profiles')
+        .select('plan_id')
+        .eq('user_id', currentUser.id)
+        .single()
+
+      const planId = profile?.plan_id || 'free'
+
+      // Set plan limits (use defaults for now, can be database-driven later)
+      setPlanLimits(DEFAULT_PLAN_LIMITS[planId] || DEFAULT_PLAN_LIMITS.free)
+
+      // Load subscription if exists
       const { data: subData, error: subError } = await supabase
         .from('user_subscriptions')
         .select('*')
         .eq('user_id', currentUser.id)
         .single()
 
-      if (subError && subError.code !== 'PGRST116') { // Not found is OK
-        console.error('Subscription error:', subError)
-      } else {
+      if (!subError) {
         setSubscription(subData)
-      }
-
-      // Load plan limits - try direct query first
-      const { data: limitsData, error: limitsError } = await supabase
-        .from('plan_limits')
-        .select('*')
-        .eq('plan_id', subData?.plan_id || 'free')
-        .single()
-
-      if (limitsError) {
-        console.error('Plan limits error:', limitsError)
-        // Set default free plan limits if error
-        setPlanLimits({
-          plan_id: 'free',
-          max_portals: 2,
-          max_monthly_views: 50,
-          has_custom_branding: false,
-          has_analytics: false
-        })
-      } else {
-        setPlanLimits(limitsData)
       }
 
       // Load usage stats
@@ -88,34 +102,46 @@ export function useSubscription() {
     } catch (err) {
       console.error('Error loading subscription:', err)
       setError(err instanceof Error ? err.message : 'Unknown error')
+      // Set default free plan if error
+      setPlanLimits(DEFAULT_PLAN_LIMITS.free)
     } finally {
       setLoading(false)
     }
   }
 
   const loadUsageStats = async (currentUser: any) => {
-    if (!currentUser) return
-
     try {
-      // Count portals
-      const { count: portalCount } = await supabase
+      // Get portals count
+      const { count: portalsCount } = await supabase
         .from('portals')
-        .select('*', { count: 'exact', head: true })
+        .select('*', { count: 'exact' })
         .eq('user_id', currentUser.id)
 
-      // Count monthly views (simplified)
-      const { count: viewCount } = await supabase
+      // Get monthly views (last 30 days)
+      const thirtyDaysAgo = new Date()
+      thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30)
+
+      const { count: monthlyViews } = await supabase
         .from('portal_analytics')
-        .select('*', { count: 'exact', head: true })
-        .gte('created_at', new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString())
+        .select('*', { count: 'exact' })
+        .eq('user_id', currentUser.id)
+        .eq('event_type', 'view')
+        .gte('created_at', thirtyDaysAgo.toISOString())
+
+      // Get files count (approximate)
+      const { count: filesCount } = await supabase
+        .from('uploaded_files')
+        .select('*', { count: 'exact' })
+        .eq('uploaded_by', currentUser.id)
 
       setUsage({
-        portals_created: portalCount || 0,
-        monthly_views: viewCount || 0,
-        files_uploaded: 0 // TODO: implement file counting
+        portals_created: portalsCount || 0,
+        monthly_views: monthlyViews || 0,
+        files_uploaded: filesCount || 0
       })
-    } catch (error) {
-      console.error('Error loading usage stats:', error)
+
+    } catch (err) {
+      console.error('Error loading usage stats:', err)
       setUsage({
         portals_created: 0,
         monthly_views: 0,
@@ -129,30 +155,42 @@ export function useSubscription() {
     return usage.portals_created < planLimits.max_portals
   }
 
-  const getUsagePercentage = (metric: 'portals' | 'views') => {
+  const getUsagePercentage = (type: 'portals' | 'views') => {
     if (!planLimits || !usage) return 0
     
-    if (metric === 'portals') {
-      return Math.round((usage.portals_created / planLimits.max_portals) * 100)
+    if (type === 'portals') {
+      return Math.min(100, (usage.portals_created / planLimits.max_portals) * 100)
     }
-    if (metric === 'views') {
-      return Math.round((usage.monthly_views / planLimits.max_monthly_views) * 100)
+    
+    if (type === 'views') {
+      return Math.min(100, (usage.monthly_views / planLimits.max_monthly_views) * 100)
     }
+    
     return 0
   }
 
   const upgrade = async (planId: string) => {
-    if (!user) throw new Error('User not authenticated')
+    // This will integrate with Stripe later
+    // For now, just a placeholder
+    console.log(`Upgrading to plan: ${planId}`)
     
-    try {
-      // TODO: Implement Stripe checkout
-      console.log(`Upgrading to ${planId}`)
-      // This would typically redirect to Stripe checkout
-      window.location.href = `/api/stripe/checkout?plan=${planId}`
-    } catch (error) {
-      console.error('Upgrade error:', error)
-      throw error
+    // Redirect to Stripe checkout or show upgrade modal
+    // Implementation depends on your Stripe setup
+    throw new Error('Stripe integration not yet implemented')
+  }
+
+  const isOverLimit = (type: 'portals' | 'views') => {
+    if (!planLimits || !usage) return false
+    
+    if (type === 'portals') {
+      return usage.portals_created >= planLimits.max_portals
     }
+    
+    if (type === 'views') {
+      return usage.monthly_views >= planLimits.max_monthly_views
+    }
+    
+    return false
   }
 
   return {
@@ -163,6 +201,12 @@ export function useSubscription() {
     error,
     canCreatePortal,
     getUsagePercentage,
-    upgrade
+    upgrade,
+    isOverLimit,
+    // Helper functions
+    isPro: planLimits?.plan_id === 'pro' || planLimits?.plan_id === 'agency',
+    isFree: planLimits?.plan_id === 'free',
+    hasCustomBranding: planLimits?.has_custom_branding || false,
+    hasAnalytics: planLimits?.has_analytics || false,
   }
 }

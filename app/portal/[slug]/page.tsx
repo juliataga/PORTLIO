@@ -3,7 +3,16 @@
 import { useEffect, useState } from 'react'
 import { supabase } from '@/lib/supabase'
 import { useParams } from 'next/navigation'
-import FileUpload from '../../components/FileUpload'
+import { 
+  CheckCircle2, 
+  Upload, 
+  ExternalLink, 
+  CreditCard, 
+  FileText,
+  Eye,
+  Building
+} from 'lucide-react'
+import toast from 'react-hot-toast'
 
 type ContentBlock = {
   id: number
@@ -11,6 +20,7 @@ type ContentBlock = {
   title: string
   content: string
   block_order: number
+  settings?: Record<string, any>
 }
 
 type Portal = {
@@ -23,26 +33,27 @@ type Portal = {
   created_at: string
 }
 
-type AnalyticsData = {
-  totalViews: number
-  completedTasks: number
-  filesUploaded: number
-  lastVisit: Date | null
+type UploadedFile = {
+  id: number
+  file_name: string
+  file_size: number
+  file_type: string
+  created_at: string
+  block_id?: number
 }
 
 export default function PublicPortalPage() {
   const [portal, setPortal] = useState<Portal | null>(null)
   const [contentBlocks, setContentBlocks] = useState<ContentBlock[]>([])
-  const [analytics, setAnalytics] = useState<AnalyticsData | null>(null)
+  const [uploadedFiles, setUploadedFiles] = useState<UploadedFile[]>([])
+  const [completedBlocks, setCompletedBlocks] = useState<Set<number>>(new Set())
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
-  const [completedBlocks, setCompletedBlocks] = useState<Set<number>>(new Set())
   const params = useParams()
   const slug = params.slug as string
 
   useEffect(() => {
     loadPortal()
-    trackPageView()
   }, [slug])
 
   const loadPortal = async () => {
@@ -74,9 +85,21 @@ export default function PublicPortalPage() {
         setContentBlocks(blocksData)
       }
 
-      // Load analytics data
-      await loadAnalytics(portalData.id)
-      
+      // Load uploaded files for this portal (simplified)
+      try {
+        const { data: filesData } = await supabase
+          .from('uploaded_files')
+          .select('*')
+          .eq('portal_slug', slug)
+          .order('created_at', { ascending: false })
+
+        if (filesData) {
+          setUploadedFiles(filesData)
+        }
+      } catch (err) {
+        console.log('Could not load files:', err)
+      }
+
     } catch (error) {
       console.error('Error loading portal:', error)
       setError('Failed to load portal')
@@ -85,259 +108,96 @@ export default function PublicPortalPage() {
     }
   }
 
-  const loadAnalytics = async (portalId: number) => {
+  const handleFileUpload = async (file: File, blockId: number) => {
     try {
-      // Get total views
-      const { count: viewCount } = await supabase
-        .from('portal_analytics')
-        .select('*', { count: 'exact' })
-        .eq('portal_id', portalId)
-        .eq('event_type', 'view')
+      toast.loading('Uploading file...', { id: 'upload' })
 
-      // Get uploaded files count
-      const { count: fileCount } = await supabase
-        .from('uploaded_files')
-        .select('*', { count: 'exact' })
-        .eq('portal_slug', slug)
+      // Create file path
+      const fileExt = file.name.split('.').pop()
+      const fileName = `${Date.now()}_${Math.random().toString(36).substr(2, 9)}.${fileExt}`
+      const filePath = `${slug}/${fileName}`
 
-      // Get last visit
-      const { data: lastVisitData } = await supabase
-        .from('portal_analytics')
-        .select('created_at')
-        .eq('portal_id', portalId)
-        .eq('event_type', 'view')
-        .order('created_at', { ascending: false })
-        .limit(1)
-
-      setAnalytics({
-        totalViews: viewCount || 0,
-        completedTasks: Math.floor(Math.random() * contentBlocks.length), // Mock for now
-        filesUploaded: fileCount || 0,
-        lastVisit: lastVisitData?.[0] ? new Date(lastVisitData[0].created_at) : null
-      })
-    } catch (error) {
-      console.error('Error loading analytics:', error)
-    }
-  }
-
-  const trackPageView = async () => {
-    if (!portal) return
-
-    try {
-      await supabase
-        .from('portal_analytics')
-        .insert({
-          portal_id: portal.id,
-          event_type: 'view',
-          event_data: { 
-            page: 'portal_view',
-            timestamp: new Date().toISOString()
-          },
-          visitor_ip: null, // Could be populated server-side
-          user_agent: navigator.userAgent,
-          referrer: document.referrer || null
+      // Upload to Supabase Storage
+      const { data: uploadData, error: uploadError } = await supabase.storage
+        .from('portal-files')
+        .upload(filePath, file, {
+          cacheControl: '3600',
+          upsert: false
         })
-    } catch (error) {
-      console.error('Failed to track page view:', error)
+
+      if (uploadError) {
+        console.error('Upload error:', uploadError)
+        throw new Error('Failed to upload file to storage')
+      }
+
+      // Save file record to database with block_id
+      try {
+        const { data, error } = await supabase
+          .from('uploaded_files')
+          .insert({
+            portal_slug: slug,
+            file_name: file.name,
+            file_size: file.size,
+            file_type: file.type,
+            storage_path: filePath,
+            block_id: blockId  // Associate with specific block
+          })
+          .select()
+          .single()
+
+        if (!error && data) {
+          setUploadedFiles(prev => [data, ...prev])
+        }
+      } catch (dbError) {
+        console.log('Database save failed, but file uploaded successfully')
+      }
+
+      setCompletedBlocks(prev => new Set([...prev, blockId]))
+      toast.success('File uploaded successfully!', { id: 'upload' })
+
+    } catch (error: any) {
+      console.error('Error uploading file:', error)
+      toast.error(error.message || 'Failed to upload file', { id: 'upload' })
     }
   }
 
-  const trackEvent = async (eventType: string, eventData: object) => {
-    if (!portal) return
-
-    try {
-      await supabase
-        .from('portal_analytics')
-        .insert({
-          portal_id: portal.id,
-          event_type: eventType,
-          event_data: eventData,
-          visitor_ip: null,
-          user_agent: navigator.userAgent,
-          referrer: document.referrer || null
-        })
-    } catch (error) {
-      console.error('Failed to track event:', error)
+  const handlePaymentClick = async (blockId: number, paymentLink: string) => {
+    setCompletedBlocks(prev => new Set([...prev, blockId]))
+    
+    if (paymentLink) {
+      window.open(paymentLink, '_blank')
+      toast.success('Redirecting to payment...')
+    } else {
+      toast.error('Payment link not configured')
     }
-  }
-
-  const handleFileUploaded = async (blockId: number, fileName: string, url: string) => {
-    // Track file upload event
-    await trackEvent('file_upload', {
-      block_id: blockId,
-      filename: fileName,
-      file_url: url
-    })
-
-    // Mark block as completed
-    setCompletedBlocks(prev => new Set(prev.add(blockId)))
-
-    // Update analytics
-    if (analytics) {
-      setAnalytics({
-        ...analytics,
-        filesUploaded: analytics.filesUploaded + 1,
-        completedTasks: Math.max(analytics.completedTasks, completedBlocks.size + 1)
-      })
-    }
-  }
-
-  const handlePaymentClick = async (blockId: number) => {
-    await trackEvent('payment_click', {
-      block_id: blockId,
-      timestamp: new Date().toISOString()
-    })
-
-    // In production, redirect to Stripe checkout
-    alert('Payment processing will be integrated with Stripe')
   }
 
   const handleLinkClick = async (blockId: number, url: string) => {
-    await trackEvent('link_click', {
-      block_id: blockId,
-      url: url,
-      timestamp: new Date().toISOString()
-    })
-
-    if (url && url !== '#') {
-      window.open(url.startsWith('http') ? url : `https://${url}`, '_blank')
+    setCompletedBlocks(prev => new Set([...prev, blockId]))
+    
+    if (url) {
+      window.open(url, '_blank')
+      toast.success('Opening link...')
+    } else {
+      toast.error('Link not configured')
     }
   }
 
-  const renderContentBlock = (block: ContentBlock) => {
-    const isCompleted = completedBlocks.has(block.id)
+  const getCompletionPercentage = () => {
+    if (contentBlocks.length === 0) return 0
+    const actionableBlocks = contentBlocks.filter(block => 
+      ['payment', 'upload', 'link'].includes(block.type)
+    )
+    if (actionableBlocks.length === 0) return 100
+    return Math.round((completedBlocks.size / actionableBlocks.length) * 100)
+  }
 
-    switch (block.type) {
-      case 'text':
-        return (
-          <div className="bg-white/80 backdrop-blur-sm rounded-2xl p-8 border border-slate-200/60 shadow-sm hover:shadow-lg transition-all duration-300">
-            <div className="flex items-start gap-4">
-              <div className="w-12 h-12 bg-gradient-to-r from-blue-500 to-blue-600 rounded-xl flex items-center justify-center text-white flex-shrink-0">
-                <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16M4 18h7" />
-                </svg>
-              </div>
-              <div className="flex-1">
-                <h3 className="text-2xl font-bold text-slate-900 mb-4">{block.title}</h3>
-                <div className="text-slate-700 leading-relaxed whitespace-pre-wrap">
-                  {block.content}
-                </div>
-              </div>
-              {isCompleted && (
-                <div className="w-8 h-8 bg-emerald-500 rounded-full flex items-center justify-center">
-                  <svg className="w-5 h-5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
-                  </svg>
-                </div>
-              )}
-            </div>
-          </div>
-        )
-      
-      case 'payment':
-        return (
-          <div className="bg-white/80 backdrop-blur-sm rounded-2xl p-8 border border-slate-200/60 shadow-sm hover:shadow-lg transition-all duration-300">
-            <div className="flex items-start gap-4">
-              <div className="w-12 h-12 bg-gradient-to-r from-emerald-500 to-emerald-600 rounded-xl flex items-center justify-center text-white flex-shrink-0">
-                <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 10h18M7 15h1m4 0h1m-7 4h12a3 3 0 003-3V8a3 3 0 00-3-3H6a3 3 0 00-3 3v8a3 3 0 003 3z" />
-                </svg>
-              </div>
-              <div className="flex-1">
-                <h3 className="text-2xl font-bold text-slate-900 mb-4">{block.title}</h3>
-                <p className="text-slate-700 mb-6 leading-relaxed">{block.content}</p>
-                <button 
-                  onClick={() => handlePaymentClick(block.id)}
-                  className="bg-gradient-to-r from-emerald-600 to-emerald-700 text-white px-8 py-4 rounded-xl font-semibold hover:from-emerald-700 hover:to-emerald-800 transition-all duration-200 shadow-lg shadow-emerald-600/25 flex items-center gap-2"
-                >
-                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
-                  </svg>
-                  Complete Payment
-                </button>
-              </div>
-              {isCompleted && (
-                <div className="w-8 h-8 bg-emerald-500 rounded-full flex items-center justify-center">
-                  <svg className="w-5 h-5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
-                  </svg>
-                </div>
-              )}
-            </div>
-          </div>
-        )
-      
-      case 'upload':
-        return (
-          <div className="bg-white/80 backdrop-blur-sm rounded-2xl p-8 border border-slate-200/60 shadow-sm hover:shadow-lg transition-all duration-300">
-            <div className="flex items-start gap-4 mb-6">
-              <div className="w-12 h-12 bg-gradient-to-r from-purple-500 to-purple-600 rounded-xl flex items-center justify-center text-white flex-shrink-0">
-                <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
-                </svg>
-              </div>
-              <div className="flex-1">
-                <h3 className="text-2xl font-bold text-slate-900 mb-4">{block.title}</h3>
-                <p className="text-slate-700 mb-6 leading-relaxed">{block.content}</p>
-              </div>
-              {isCompleted && (
-                <div className="w-8 h-8 bg-emerald-500 rounded-full flex items-center justify-center">
-                  <svg className="w-5 h-5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
-                  </svg>
-                </div>
-              )}
-            </div>
-            <FileUpload 
-              portalSlug={slug} 
-              blockId={block.id}
-              maxFiles={10}
-              maxFileSize={10}
-              onFileUploaded={(file) => handleFileUploaded(block.id, file.name, file.url)}
-              onError={(error) => {
-                console.error('Upload error:', error)
-                // Show error notification
-              }}
-            />
-          </div>
-        )
-      
-      case 'link':
-        return (
-          <div className="bg-white/80 backdrop-blur-sm rounded-2xl p-8 border border-slate-200/60 shadow-sm hover:shadow-lg transition-all duration-300">
-            <div className="flex items-start gap-4">
-              <div className="w-12 h-12 bg-gradient-to-r from-orange-500 to-orange-600 rounded-xl flex items-center justify-center text-white flex-shrink-0">
-                <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1" />
-                </svg>
-              </div>
-              <div className="flex-1">
-                <h3 className="text-2xl font-bold text-slate-900 mb-4">{block.title}</h3>
-                <p className="text-slate-700 mb-6 leading-relaxed">{block.content}</p>
-                <button 
-                  onClick={() => handleLinkClick(block.id, block.content)}
-                  className="bg-gradient-to-r from-orange-600 to-orange-700 text-white px-8 py-4 rounded-xl font-semibold hover:from-orange-700 hover:to-orange-800 transition-all duration-200 shadow-lg shadow-orange-600/25 flex items-center gap-2"
-                >
-                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
-                  </svg>
-                  Open Link
-                </button>
-              </div>
-              {isCompleted && (
-                <div className="w-8 h-8 bg-emerald-500 rounded-full flex items-center justify-center">
-                  <svg className="w-5 h-5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
-                  </svg>
-                </div>
-              )}
-            </div>
-          </div>
-        )
-      
-      default:
-        return null
-    }
+  const formatFileSize = (bytes: number) => {
+    if (bytes === 0) return '0 Bytes'
+    const k = 1024
+    const sizes = ['Bytes', 'KB', 'MB', 'GB']
+    const i = Math.floor(Math.log(bytes) / Math.log(k))
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i]
   }
 
   if (loading) {
@@ -345,7 +205,7 @@ export default function PublicPortalPage() {
       <div className="min-h-screen bg-gradient-to-br from-slate-50 to-indigo-50 flex items-center justify-center">
         <div className="text-center">
           <div className="w-12 h-12 border-4 border-indigo-600 border-t-transparent rounded-full animate-spin mb-4"></div>
-          <div className="text-xl font-medium text-slate-900">Loading portal...</div>
+          <div className="text-xl font-medium text-slate-900">Loading your portal...</div>
         </div>
       </div>
     )
@@ -354,99 +214,337 @@ export default function PublicPortalPage() {
   if (error || !portal) {
     return (
       <div className="min-h-screen bg-gradient-to-br from-slate-50 to-indigo-50 flex items-center justify-center">
-        <div className="text-center">
-          <div className="w-20 h-20 bg-gradient-to-r from-red-500 to-red-600 rounded-3xl flex items-center justify-center mx-auto mb-6">
-            <svg className="w-10 h-10 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L4.082 16.5c-.77.833.192 2.5 1.732 2.5z" />
-            </svg>
+        <div className="text-center max-w-md mx-auto px-6">
+          <div className="w-16 h-16 bg-red-100 rounded-full flex items-center justify-center mx-auto mb-4">
+            <Eye className="w-8 h-8 text-red-500" />
           </div>
           <h1 className="text-2xl font-bold text-slate-900 mb-2">Portal Not Found</h1>
-          <p className="text-slate-600">{error}</p>
+          <p className="text-slate-600 mb-6">
+            This portal may not exist, has been unpublished, or the link is incorrect.
+          </p>
         </div>
       </div>
     )
   }
 
-  const progressPercentage = contentBlocks.length > 0 ? (completedBlocks.size / contentBlocks.length) * 100 : 0
+  const completionPercentage = getCompletionPercentage()
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-slate-50 to-indigo-50">
+    <div className="min-h-screen bg-gradient-to-br from-slate-50 via-blue-50 to-indigo-50">
       {/* Header */}
-      <div className="bg-white/80 backdrop-blur-sm shadow-sm border-b border-slate-200/60">
-        <div className="max-w-5xl mx-auto px-6 py-12">
-          <div className="text-center">
-            <div className="w-16 h-16 bg-gradient-to-r from-indigo-600 to-purple-600 rounded-2xl flex items-center justify-center mx-auto mb-6">
-              <svg className="w-8 h-8 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
-              </svg>
+      <header className="bg-white/80 backdrop-blur-sm border-b border-slate-200/60 sticky top-0 z-40">
+        <div className="max-w-4xl mx-auto px-6 py-6">
+          <div className="flex items-center justify-between">
+            <div>
+              <h1 className="text-2xl font-bold text-slate-900">{portal.title}</h1>
+              <p className="text-slate-600 mt-1">{portal.description}</p>
             </div>
-            <h1 className="text-5xl font-bold text-slate-900 mb-4">
-              {portal.title}
-            </h1>
-            <p className="text-xl text-slate-600 leading-relaxed max-w-3xl mx-auto">
-              {portal.description}
+            <div className="text-right">
+              <div className="text-sm text-slate-500 mb-1">Progress</div>
+              <div className="flex items-center gap-2">
+                <div className="w-16 h-2 bg-slate-200 rounded-full overflow-hidden">
+                  <div 
+                    className="h-full bg-gradient-to-r from-green-500 to-emerald-500 transition-all duration-500"
+                    style={{ width: `${completionPercentage}%` }}
+                  />
+                </div>
+                <span className="text-sm font-medium text-slate-700">{completionPercentage}%</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </header>
+
+      <div className="max-w-4xl mx-auto px-6 py-8">
+        {/* Content Blocks */}
+        <div className="space-y-6">
+          {contentBlocks.map((block, index) => (
+            <div key={block.id} className="bg-white/80 backdrop-blur-sm rounded-2xl border border-slate-200/60 overflow-hidden shadow-sm">
+              {/* Block Header */}
+              <div className="p-6 pb-4">
+                <div className="flex items-start gap-4">
+                  <div className="flex-shrink-0">
+                    <div className={`w-10 h-10 rounded-xl flex items-center justify-center ${
+                      completedBlocks.has(block.id)
+                        ? 'bg-green-100 text-green-600'
+                        : block.type === 'text'
+                        ? 'bg-blue-100 text-blue-600'
+                        : block.type === 'payment'
+                        ? 'bg-emerald-100 text-emerald-600'
+                        : block.type === 'upload'
+                        ? 'bg-purple-100 text-purple-600'
+                        : 'bg-orange-100 text-orange-600'
+                    }`}>
+                      {completedBlocks.has(block.id) ? (
+                        <CheckCircle2 className="w-5 h-5" />
+                      ) : block.type === 'text' ? (
+                        <FileText className="w-5 h-5" />
+                      ) : block.type === 'payment' ? (
+                        <CreditCard className="w-5 h-5" />
+                      ) : block.type === 'upload' ? (
+                        <Upload className="w-5 h-5" />
+                      ) : (
+                        <ExternalLink className="w-5 h-5" />
+                      )}
+                    </div>
+                  </div>
+                  <div className="flex-1">
+                    <h3 className="text-lg font-semibold text-slate-900 mb-2">{block.title}</h3>
+                    <p className="text-slate-600 leading-relaxed">{block.content}</p>
+                  </div>
+                  {completedBlocks.has(block.id) && (
+                    <div className="flex-shrink-0">
+                      <span className="inline-flex items-center gap-1 bg-green-100 text-green-700 text-xs font-medium px-2.5 py-1 rounded-full">
+                        <CheckCircle2 className="w-3 h-3" />
+                        Complete
+                      </span>
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* Block Action Area */}
+              <div className="px-6 pb-6">
+                {block.type === 'payment' && (
+                  <div className="bg-emerald-50 rounded-xl p-4 border border-emerald-200">
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <div className="text-sm font-medium text-emerald-900 mb-1">
+                          Payment Required
+                        </div>
+                        <div className="text-xs text-emerald-700">
+                          Amount: ${block.settings?.amount || '100'}
+                        </div>
+                      </div>
+                      <button
+                        onClick={() => handlePaymentClick(block.id, block.settings?.payment_link)}
+                        disabled={completedBlocks.has(block.id)}
+                        className={`flex items-center gap-2 px-4 py-2 rounded-lg font-medium transition-all ${
+                          completedBlocks.has(block.id)
+                            ? 'bg-green-600 text-white cursor-not-allowed'
+                            : 'bg-emerald-600 text-white hover:bg-emerald-700 hover:shadow-lg'
+                        }`}
+                      >
+                        <CreditCard className="w-4 h-4" />
+                        {completedBlocks.has(block.id) ? 'Payment Clicked' : 'Pay Now'}
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {block.type === 'upload' && (
+                  <div className="space-y-4">
+                    {!completedBlocks.has(block.id) && (
+                      <FileUploadZone
+                        onFileUpload={(file) => handleFileUpload(file, block.id)}
+                        maxFiles={block.settings?.max_files || 5}
+                        acceptedTypes={block.settings?.accepted_types || 'pdf,jpg,png,doc,docx'}
+                      />
+                    )}
+                    
+                    {/* Show only files for this specific block */}
+                    {(() => {
+                      const blockFiles = uploadedFiles.filter(file => file.block_id === block.id)
+                      return blockFiles.length > 0 && (
+                        <div className="bg-purple-50 rounded-xl p-4 border border-purple-200">
+                          <div className="text-sm font-medium text-purple-900 mb-3">
+                            Uploaded Files ({blockFiles.length})
+                          </div>
+                          <div className="space-y-2">
+                            {blockFiles.slice(0, 3).map((file) => (
+                              <div key={file.id} className="flex items-center gap-3 text-sm">
+                                <div className="w-6 h-6 bg-purple-100 rounded flex items-center justify-center">
+                                  <FileText className="w-3 h-3 text-purple-600" />
+                                </div>
+                                <div className="flex-1 truncate">
+                                  <div className="font-medium text-purple-900">{file.file_name}</div>
+                                </div>
+                                <div className="text-purple-600 text-xs">
+                                  {formatFileSize(file.file_size)}
+                                </div>
+                              </div>
+                            ))}
+                            {blockFiles.length > 3 && (
+                              <div className="text-xs text-purple-700 pt-2">
+                                +{blockFiles.length - 3} more files
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      )
+                    })()}
+                  </div>
+                )}
+
+                {block.type === 'link' && (
+                  <div className="bg-orange-50 rounded-xl p-4 border border-orange-200">
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <div className="text-sm font-medium text-orange-900 mb-1">
+                          External Link
+                        </div>
+                        <div className="text-xs text-orange-700">
+                          Click to open in new tab
+                        </div>
+                      </div>
+                      <button
+                        onClick={() => handleLinkClick(block.id, block.settings?.url)}
+                        disabled={completedBlocks.has(block.id)}
+                        className={`flex items-center gap-2 px-4 py-2 rounded-lg font-medium transition-all ${
+                          completedBlocks.has(block.id)
+                            ? 'bg-green-600 text-white cursor-not-allowed'
+                            : 'bg-orange-600 text-white hover:bg-orange-700 hover:shadow-lg'
+                        }`}
+                      >
+                        <ExternalLink className="w-4 h-4" />
+                        {completedBlocks.has(block.id) ? 'Visited' : (block.settings?.button_text || 'Open Link')}
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+
+        {/* Completion Message */}
+        {completionPercentage === 100 && (
+          <div className="mt-8 bg-gradient-to-r from-green-500 to-emerald-500 rounded-2xl p-6 text-white text-center">
+            <div className="w-16 h-16 bg-white/20 rounded-full flex items-center justify-center mx-auto mb-4">
+              <CheckCircle2 className="w-8 h-8" />
+            </div>
+            <h3 className="text-xl font-bold mb-2">All Done! 🎉</h3>
+            <p className="text-green-100">
+              You've completed all the required tasks. We'll be in touch soon!
             </p>
           </div>
-        </div>
-      </div>
+        )}
 
-      {/* Progress Bar */}
-      <div className="bg-white/60 backdrop-blur-sm border-b border-slate-200/40">
-        <div className="max-w-5xl mx-auto px-6 py-6">
-          <div className="flex items-center justify-between text-sm mb-3">
-            <span className="text-slate-600 font-medium">Your Progress</span>
-            <span className="text-indigo-600 font-bold">{completedBlocks.size} of {contentBlocks.length} completed</span>
+        {/* Footer */}
+        <footer className="mt-12 text-center text-sm text-slate-500">
+          <div className="flex items-center justify-center gap-2 mb-2">
+            <Building className="w-4 h-4" />
+            Powered by Portlio
           </div>
-          <div className="bg-slate-200 rounded-full h-3 overflow-hidden">
-            <div 
-              className="bg-gradient-to-r from-indigo-600 to-purple-600 h-3 rounded-full transition-all duration-500 ease-out"
-              style={{ width: `${progressPercentage}%` }}
-            ></div>
-          </div>
-          
-          {analytics && (
-            <div className="flex items-center gap-6 text-xs text-slate-500 mt-3">
-              <span>👀 {analytics.totalViews} views</span>
-              <span>📁 {analytics.filesUploaded} files uploaded</span>
-              {analytics.lastVisit && (
-                <span>🕐 Last visit: {analytics.lastVisit.toLocaleDateString()}</span>
-              )}
-            </div>
-          )}
-        </div>
+          <p>Professional client onboarding made simple</p>
+        </footer>
       </div>
+    </div>
+  )
+}
 
-      {/* Content */}
-      <div className="max-w-5xl mx-auto px-6 py-12">
-        <div className="space-y-8">
-          {contentBlocks.length === 0 ? (
-            <div className="text-center py-16">
-              <div className="w-20 h-20 bg-gradient-to-r from-slate-400 to-slate-500 rounded-3xl flex items-center justify-center mx-auto mb-6">
-                <svg className="w-10 h-10 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
-                </svg>
-              </div>
-              <h3 className="text-2xl font-bold text-slate-900 mb-4">Portal is being set up</h3>
-              <p className="text-lg text-slate-600">Content will be available soon!</p>
-            </div>
+// File Upload Component
+function FileUploadZone({ 
+  onFileUpload, 
+  maxFiles, 
+  acceptedTypes 
+}: { 
+  onFileUpload: (file: File) => void
+  maxFiles: number
+  acceptedTypes: string
+}) {
+  const [dragActive, setDragActive] = useState(false)
+  const [uploading, setUploading] = useState(false)
+
+  const validateFile = (file: File): string | null => {
+    if (file.size > 10 * 1024 * 1024) {
+      return 'File size must be less than 10MB'
+    }
+
+    const allowedTypes = acceptedTypes.split(',').map(type => type.trim().toLowerCase())
+    const fileExt = file.name.split('.').pop()?.toLowerCase()
+    
+    if (!fileExt || !allowedTypes.includes(fileExt)) {
+      return `File type not allowed. Accepted: ${acceptedTypes.toUpperCase()}`
+    }
+
+    return null
+  }
+
+  const handleDrag = (e: React.DragEvent) => {
+    e.preventDefault()
+    e.stopPropagation()
+    if (e.type === "dragenter" || e.type === "dragover") {
+      setDragActive(true)
+    } else if (e.type === "dragleave") {
+      setDragActive(false)
+    }
+  }
+
+  const handleDrop = async (e: React.DragEvent) => {
+    e.preventDefault()
+    e.stopPropagation()
+    setDragActive(false)
+    
+    if (e.dataTransfer.files && e.dataTransfer.files[0]) {
+      const file = e.dataTransfer.files[0]
+      const error = validateFile(file)
+      
+      if (error) {
+        toast.error(error)
+        return
+      }
+
+      setUploading(true)
+      await onFileUpload(file)
+      setUploading(false)
+    }
+  }
+
+  const handleChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    e.preventDefault()
+    if (e.target.files && e.target.files[0]) {
+      const file = e.target.files[0]
+      const error = validateFile(file)
+      
+      if (error) {
+        toast.error(error)
+        return
+      }
+
+      setUploading(true)
+      await onFileUpload(file)
+      setUploading(false)
+    }
+    e.target.value = ''
+  }
+
+  return (
+    <div 
+      className={`relative border-2 border-dashed rounded-xl p-6 text-center transition-all ${
+        uploading
+          ? 'border-purple-400 bg-purple-50 cursor-wait'
+          : dragActive 
+          ? 'border-purple-400 bg-purple-50' 
+          : 'border-purple-300 bg-purple-50 hover:border-purple-400 cursor-pointer'
+      }`}
+      onDragEnter={handleDrag}
+      onDragLeave={handleDrag}
+      onDragOver={handleDrag}
+      onDrop={handleDrop}
+    >
+      <input
+        type="file"
+        accept={acceptedTypes.split(',').map(type => `.${type.trim()}`).join(',')}
+        onChange={handleChange}
+        disabled={uploading}
+        className="absolute inset-0 w-full h-full opacity-0 cursor-pointer disabled:cursor-wait"
+      />
+      
+      <div className="space-y-3">
+        <div className="w-12 h-12 bg-purple-100 rounded-xl flex items-center justify-center mx-auto">
+          {uploading ? (
+            <div className="w-6 h-6 border-2 border-purple-600 border-t-transparent rounded-full animate-spin" />
           ) : (
-            contentBlocks.map((block, index) => (
-              <div key={block.id} className="group">
-                {renderContentBlock(block)}
-              </div>
-            ))
+            <Upload className="w-6 h-6 text-purple-600" />
           )}
         </div>
-      </div>
-
-      {/* Footer */}
-      <div className="bg-slate-900 text-white py-12 mt-16">
-        <div className="max-w-5xl mx-auto px-6 text-center">
-          <p className="text-slate-400 mb-4">
-            Powered by <span className="text-white font-semibold">Portlio</span>
+        <div>
+          <p className="font-medium text-purple-900 mb-1">
+            {uploading ? 'Uploading...' : 'Drop your file here or click to browse'}
           </p>
-          <p className="text-xs text-slate-500">
-            Create your own professional client portals at portlio.com
+          <p className="text-sm text-purple-700">
+            Accepted: {acceptedTypes.toUpperCase()} • Max {maxFiles} files • 10MB limit
           </p>
         </div>
       </div>
